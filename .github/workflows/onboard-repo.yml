@@ -1,0 +1,184 @@
+name: Repo Onboard
+
+# Bir repoyu tek tikla Firebase deployment standardina baglar.
+# Dosyalari olusturur + secret'lari kurar.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Repo adi (ornek: gunkar-fiyat)'
+        required: true
+        type: string
+      project_id:
+        description: 'Firebase project ID'
+        required: true
+        type: string
+      sa_secret_name:
+        description: 'Merkezi repodaki SA secret adi'
+        required: false
+        default: SA_GULGUN_SIPARIS
+        type: string
+      targets:
+        description: 'Deploy hedefi'
+        required: false
+        default: 'firestore:rules'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  onboard:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ONBOARD_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ inputs.repo }}
+      PROJECT: ${{ inputs.project_id }}
+    steps:
+
+      - name: Hedef repoyu dogrula
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/$OWNER/$REPO" >/dev/null 2>&1; then
+            echo "::error::Repo bulunamadi: $OWNER/$REPO"
+            exit 1
+          fi
+          echo "Repo bulundu: $OWNER/$REPO"
+
+          if gh api "repos/$OWNER/$REPO/contents/.firebaserc" >/dev/null 2>&1; then
+            RC=$(gh api "repos/$OWNER/$REPO/contents/.firebaserc" --jq '.content' | base64 -d)
+            REPO_PROJECT=$(echo "$RC" | jq -r '.projects.default // empty')
+            if [ -n "$REPO_PROJECT" ] && [ "$REPO_PROJECT" != "$PROJECT" ]; then
+              echo "::error::UYUSMAZLIK - .firebaserc: '$REPO_PROJECT' / girilen: '$PROJECT'"
+              exit 1
+            fi
+            echo ".firebaserc mevcut ve eslesiyor"
+          else
+            echo ".firebaserc yok - olusturulacak"
+            echo "CREATE_RC=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: .firebaserc olustur
+        if: env.CREATE_RC == '1'
+        run: |
+          set -euo pipefail
+          CONTENT=$(printf '{\n  "projects": {\n    "default": "%s"\n  }\n}\n' "$PROJECT" | base64 -w0)
+          gh api -X PUT "repos/$OWNER/$REPO/contents/.firebaserc" \
+            -f message="Firebase deployment standardi: .firebaserc" \
+            -f content="$CONTENT" >/dev/null
+          echo ".firebaserc olusturuldu"
+
+      - name: Deploy workflow olustur
+        run: |
+          set -euo pipefail
+          PATH_WF=".github/workflows/deploy-firebase.yml"
+
+          if gh api "repos/$OWNER/$REPO/contents/$PATH_WF" >/dev/null 2>&1; then
+            echo "Workflow zaten var - atlaniyor"
+            exit 0
+          fi
+
+          cat > wf.yml <<EOF
+name: Firebase Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firestore.rules'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Sadece dogrula, deploy etme'
+        type: boolean
+        default: true
+
+concurrency:
+  group: firebase-\${{ github.ref }}
+
+jobs:
+  rules:
+    uses: $OWNER/firebase-deploy/.github/workflows/firebase-deploy.yml@main
+    with:
+      project_id: $PROJECT
+      environment: production
+      targets: ${{ inputs.targets }}
+      dry_run: \${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    secrets:
+      FIREBASE_SERVICE_ACCOUNT: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
+EOF
+
+          gh api -X PUT "repos/$OWNER/$REPO/contents/$PATH_WF" \
+            -f message="Firebase deployment standardi: deploy workflow" \
+            -f content="$(base64 -w0 wf.yml)" >/dev/null
+          echo "Deploy workflow olusturuldu"
+
+      - name: Drift workflow olustur
+        run: |
+          set -euo pipefail
+          PATH_WF=".github/workflows/rules-drift.yml"
+
+          if gh api "repos/$OWNER/$REPO/contents/$PATH_WF" >/dev/null 2>&1; then
+            echo "Drift workflow zaten var - atlaniyor"
+            exit 0
+          fi
+
+          cat > drift.yml <<EOF
+name: Rules Drift Check
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    uses: $OWNER/firebase-deploy/.github/workflows/rules-drift-check.yml@main
+    with:
+      project_id: $PROJECT
+      fail_on_drift: true
+    secrets:
+      FIREBASE_SERVICE_ACCOUNT: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
+EOF
+
+          gh api -X PUT "repos/$OWNER/$REPO/contents/$PATH_WF" \
+            -f message="Firebase deployment standardi: drift check" \
+            -f content="$(base64 -w0 drift.yml)" >/dev/null
+          echo "Drift workflow olusturuldu"
+
+      - name: Secret'lari kur
+        env:
+          SA_JSON: ${{ secrets[inputs.sa_secret_name] }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SA_JSON:-}" ]; then
+            echo "::error::Secret bulunamadi: ${{ inputs.sa_secret_name }}"
+            exit 1
+          fi
+
+          KEY_PROJECT=$(printf '%s' "$SA_JSON" | jq -r '.project_id // empty')
+          if [ "$KEY_PROJECT" != "$PROJECT" ]; then
+            echo "::error::Anahtar '$KEY_PROJECT' projesine ait / girilen '$PROJECT'"
+            exit 1
+          fi
+
+          printf '%s' "$SA_JSON" | gh secret set FIREBASE_SERVICE_ACCOUNT_PROD --repo "$OWNER/$REPO"
+          printf '%s' "$SA_JSON" | gh secret set FIREBASE_SERVICE_ACCOUNT_STAGING --repo "$OWNER/$REPO"
+          echo "Secret'lar kuruldu"
+
+      - name: Ozet
+        run: |
+          {
+            echo "### Onboarding tamamlandi"
+            echo ""
+            echo "| Alan | Deger |"
+            echo "|---|---|"
+            echo "| Repo | $OWNER/$REPO |"
+            echo "| Project | $PROJECT |"
+            echo "| Hedef | ${{ inputs.targets }} |"
+            echo ""
+            echo "**Kalan manuel is:** repoda \`firestore.rules\` yoksa olustur."
+            echo "Sonra o repoda Firebase Deploy workflow'unu dry_run ile calistir."
+          } >> "$GITHUB_STEP_SUMMARY"
