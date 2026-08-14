@@ -1,8 +1,5 @@
 name: Repo Onboard
 
-# Bir repoyu tek tikla Firebase deployment standardina baglar.
-# Dosyalari olusturur + secret'lari kurar.
-
 on:
   workflow_dispatch:
     inputs:
@@ -36,6 +33,7 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       REPO: ${{ inputs.repo }}
       PROJECT: ${{ inputs.project_id }}
+      TARGETS: ${{ inputs.targets }}
     steps:
 
       - name: Hedef repoyu dogrula
@@ -51,12 +49,11 @@ jobs:
             RC=$(gh api "repos/$OWNER/$REPO/contents/.firebaserc" --jq '.content' | base64 -d)
             REPO_PROJECT=$(echo "$RC" | jq -r '.projects.default // empty')
             if [ -n "$REPO_PROJECT" ] && [ "$REPO_PROJECT" != "$PROJECT" ]; then
-              echo "::error::UYUSMAZLIK - .firebaserc: '$REPO_PROJECT' / girilen: '$PROJECT'"
+              echo "::error::UYUSMAZLIK - .firebaserc: $REPO_PROJECT / girilen: $PROJECT"
               exit 1
             fi
             echo ".firebaserc mevcut ve eslesiyor"
           else
-            echo ".firebaserc yok - olusturulacak"
             echo "CREATE_RC=1" >> "$GITHUB_ENV"
           fi
 
@@ -66,85 +63,79 @@ jobs:
           set -euo pipefail
           CONTENT=$(printf '{\n  "projects": {\n    "default": "%s"\n  }\n}\n' "$PROJECT" | base64 -w0)
           gh api -X PUT "repos/$OWNER/$REPO/contents/.firebaserc" \
-            -f message="Firebase deployment standardi: .firebaserc" \
+            -f message="Firebase standardi: .firebaserc" \
             -f content="$CONTENT" >/dev/null
           echo ".firebaserc olusturuldu"
 
       - name: Deploy workflow olustur
         run: |
           set -euo pipefail
-          PATH_WF=".github/workflows/deploy-firebase.yml"
-
-          if gh api "repos/$OWNER/$REPO/contents/$PATH_WF" >/dev/null 2>&1; then
-            echo "Workflow zaten var - atlaniyor"
-            exit 0
+          WF=".github/workflows/deploy-firebase.yml"
+          if gh api "repos/$OWNER/$REPO/contents/$WF" >/dev/null 2>&1; then
+            echo "Zaten var - atlaniyor"; exit 0
           fi
 
-          cat > wf.yml <<EOF
-name: Firebase Deploy
+          D='$'
+          {
+            echo "name: Firebase Deploy"
+            echo ""
+            echo "on:"
+            echo "  push:"
+            echo "    branches: [main]"
+            echo "    paths:"
+            echo "      - 'firestore.rules'"
+            echo "  workflow_dispatch:"
+            echo "    inputs:"
+            echo "      dry_run:"
+            echo "        type: boolean"
+            echo "        default: true"
+            echo ""
+            echo "jobs:"
+            echo "  rules:"
+            echo "    uses: $OWNER/firebase-deploy/.github/workflows/firebase-deploy.yml@main"
+            echo "    with:"
+            echo "      project_id: $PROJECT"
+            echo "      environment: production"
+            echo "      targets: $TARGETS"
+            echo "      dry_run: ${D}{{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}"
+            echo "    secrets:"
+            echo "      FIREBASE_SERVICE_ACCOUNT: ${D}{{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}"
+          } > wf.yml
 
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'firestore.rules'
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Sadece dogrula, deploy etme'
-        type: boolean
-        default: true
-
-concurrency:
-  group: firebase-\${{ github.ref }}
-
-jobs:
-  rules:
-    uses: $OWNER/firebase-deploy/.github/workflows/firebase-deploy.yml@main
-    with:
-      project_id: $PROJECT
-      environment: production
-      targets: ${{ inputs.targets }}
-      dry_run: \${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
-    secrets:
-      FIREBASE_SERVICE_ACCOUNT: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
-EOF
-
-          gh api -X PUT "repos/$OWNER/$REPO/contents/$PATH_WF" \
-            -f message="Firebase deployment standardi: deploy workflow" \
+          gh api -X PUT "repos/$OWNER/$REPO/contents/$WF" \
+            -f message="Firebase standardi: deploy workflow" \
             -f content="$(base64 -w0 wf.yml)" >/dev/null
           echo "Deploy workflow olusturuldu"
 
       - name: Drift workflow olustur
         run: |
           set -euo pipefail
-          PATH_WF=".github/workflows/rules-drift.yml"
-
-          if gh api "repos/$OWNER/$REPO/contents/$PATH_WF" >/dev/null 2>&1; then
-            echo "Drift workflow zaten var - atlaniyor"
-            exit 0
+          WF=".github/workflows/rules-drift.yml"
+          if gh api "repos/$OWNER/$REPO/contents/$WF" >/dev/null 2>&1; then
+            echo "Zaten var - atlaniyor"; exit 0
           fi
 
-          cat > drift.yml <<EOF
-name: Rules Drift Check
+          D='$'
+          {
+            echo "name: Rules Drift Check"
+            echo ""
+            echo "on:"
+            echo "  schedule:"
+            echo "    - cron: '30 6 * * 1'"
+            echo "  workflow_dispatch:"
+            echo ""
+            echo "jobs:"
+            echo "  drift:"
+            echo "    uses: $OWNER/firebase-deploy/.github/workflows/rules-drift-check.yml@main"
+            echo "    with:"
+            echo "      project_id: $PROJECT"
+            echo "      fail_on_drift: true"
+            echo "    secrets:"
+            echo "      FIREBASE_SERVICE_ACCOUNT: ${D}{{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}"
+          } > drift.yml
 
-on:
-  schedule:
-    - cron: '30 6 * * 1'
-  workflow_dispatch:
-
-jobs:
-  drift:
-    uses: $OWNER/firebase-deploy/.github/workflows/rules-drift-check.yml@main
-    with:
-      project_id: $PROJECT
-      fail_on_drift: true
-    secrets:
-      FIREBASE_SERVICE_ACCOUNT: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_PROD }}
-EOF
-
-          gh api -X PUT "repos/$OWNER/$REPO/contents/$PATH_WF" \
-            -f message="Firebase deployment standardi: drift check" \
+          gh api -X PUT "repos/$OWNER/$REPO/contents/$WF" \
+            -f message="Firebase standardi: drift check" \
             -f content="$(base64 -w0 drift.yml)" >/dev/null
           echo "Drift workflow olusturuldu"
 
@@ -160,7 +151,7 @@ EOF
 
           KEY_PROJECT=$(printf '%s' "$SA_JSON" | jq -r '.project_id // empty')
           if [ "$KEY_PROJECT" != "$PROJECT" ]; then
-            echo "::error::Anahtar '$KEY_PROJECT' projesine ait / girilen '$PROJECT'"
+            echo "::error::Anahtar $KEY_PROJECT projesine ait / girilen $PROJECT"
             exit 1
           fi
 
@@ -173,12 +164,9 @@ EOF
           {
             echo "### Onboarding tamamlandi"
             echo ""
-            echo "| Alan | Deger |"
-            echo "|---|---|"
-            echo "| Repo | $OWNER/$REPO |"
-            echo "| Project | $PROJECT |"
-            echo "| Hedef | ${{ inputs.targets }} |"
+            echo "- Repo: $OWNER/$REPO"
+            echo "- Project: $PROJECT"
+            echo "- Hedef: $TARGETS"
             echo ""
-            echo "**Kalan manuel is:** repoda \`firestore.rules\` yoksa olustur."
-            echo "Sonra o repoda Firebase Deploy workflow'unu dry_run ile calistir."
+            echo "Kalan is: repoda firestore.rules yoksa olustur."
           } >> "$GITHUB_STEP_SUMMARY"
