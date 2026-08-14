@@ -1,0 +1,120 @@
+name: Cloud Run Function Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project_id:
+        required: true
+        type: string
+      function_name:
+        required: true
+        type: string
+      region:
+        required: false
+        default: europe-west1
+        type: string
+      entry_point:
+        required: true
+        type: string
+      source_dir:
+        required: false
+        default: functions
+        type: string
+      runtime:
+        required: false
+        default: nodejs20
+        type: string
+      allow_unauthenticated:
+        required: false
+        default: false
+        type: boolean
+      environment:
+        required: false
+        default: production
+        type: string
+      dry_run:
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      FIREBASE_SERVICE_ACCOUNT:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.function_name }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Project ID dogrula
+        env:
+          SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ inputs.project_id }}"
+          KEY_PROJECT=$(printf '%s' "$SA_JSON" | jq -r '.project_id // empty')
+          if [ "$KEY_PROJECT" != "$EXPECTED" ]; then
+            echo "::error::UYUSMAZLIK - anahtar '$KEY_PROJECT' / beklenen '$EXPECTED'. DURDURULDU."
+            exit 1
+          fi
+          if [ ! -d "${{ inputs.source_dir }}" ]; then
+            echo "::error::Kaynak klasor yok: ${{ inputs.source_dir }}"
+            exit 1
+          fi
+          echo "Project ID dogrulandi: $EXPECTED"
+
+      - name: Plan
+        run: |
+          {
+            echo "### Cloud Run function deploy plani"
+            echo ""
+            echo "| Alan | Deger |"
+            echo "|---|---|"
+            echo "| Repo | ${{ github.repository }} |"
+            echo "| Project | ${{ inputs.project_id }} (dogrulandi) |"
+            echo "| Fonksiyon | ${{ inputs.function_name }} |"
+            echo "| Bolge | ${{ inputs.region }} |"
+            echo "| Kaynak | ${{ inputs.source_dir }} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Google kimlik
+        if: inputs.dry_run == false
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: gcloud kur
+        if: inputs.dry_run == false
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy
+        if: inputs.dry_run == false
+        run: |
+          set -euo pipefail
+          AUTH_FLAG="--no-allow-unauthenticated"
+          if [ "${{ inputs.allow_unauthenticated }}" = "true" ]; then
+            AUTH_FLAG="--allow-unauthenticated"
+          fi
+          gcloud functions deploy "${{ inputs.function_name }}" \
+            --gen2 \
+            --runtime="${{ inputs.runtime }}" \
+            --region="${{ inputs.region }}" \
+            --source="${{ inputs.source_dir }}" \
+            --entry-point="${{ inputs.entry_point }}" \
+            --trigger-http \
+            $AUTH_FLAG \
+            --project="${{ inputs.project_id }}"
+
+      - name: Adres
+        if: inputs.dry_run == false
+        run: |
+          gcloud functions describe "${{ inputs.function_name }}" \
+            --gen2 --region="${{ inputs.region }}" \
+            --project="${{ inputs.project_id }}" \
+            --format="value(serviceConfig.uri)"
