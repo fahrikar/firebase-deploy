@@ -1,0 +1,264 @@
+name: Firebase Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project_id:
+        description: "Beklenen Firebase project ID. Eslesmezse deployment durur."
+        required: true
+        type: string
+      environment:
+        description: "GitHub Environment adi: staging veya production"
+        required: false
+        default: staging
+        type: string
+      targets:
+        description: "auto | virgullu liste: firestore:rules,storage,hosting,functions"
+        required: false
+        default: auto
+        type: string
+      functions_filter:
+        description: "Ornek: teklifAyristir. Bos ise tum functions."
+        required: false
+        default: ""
+        type: string
+      working_directory:
+        description: "firebase.json dosyasinin bulundugu klasor"
+        required: false
+        default: "."
+        type: string
+      dry_run:
+        description: "true ise sadece dogrulama yapar, deploy etmez"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      FIREBASE_SERVICE_ACCOUNT:
+        description: "Service account JSON key (tam icerik)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  preflight:
+    name: Preflight dogrulama
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_targets: ${{ steps.plan.outputs.deploy_targets }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Baglam bilgisi
+        run: |
+          echo "Repo            : ${{ github.repository }}"
+          echo "Branch          : ${{ github.ref_name }}"
+          echo "Commit          : ${{ github.sha }}"
+          echo "Beklenen project: ${{ inputs.project_id }}"
+          echo "Environment     : ${{ inputs.environment }}"
+          echo "Hedef (istenen) : ${{ inputs.targets }}"
+
+      - name: Firebase yapisini tespit et
+        id: detect
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f firebase.json ]; then
+            echo "::error::firebase.json bulunamadi."
+            exit 1
+          fi
+          if [ ! -f .firebaserc ]; then
+            echo "::error::.firebaserc bulunamadi. Deployment durduruldu."
+            exit 1
+          fi
+
+          REPO_PROJECT=$(jq -r '.projects.default // empty' .firebaserc)
+          if [ -z "$REPO_PROJECT" ]; then
+            echo "::error::.firebaserc icinde projects.default tanimli degil."
+            exit 1
+          fi
+          echo "repo_project=$REPO_PROJECT" >> "$GITHUB_OUTPUT"
+
+          HAS_FIRESTORE_RULES=false; HAS_STORAGE_RULES=false
+          HAS_HOSTING=false;         HAS_FUNCTIONS=false
+          [ -f firestore.rules ] && HAS_FIRESTORE_RULES=true
+          [ -f storage.rules ]   && HAS_STORAGE_RULES=true
+          jq -e '.hosting'   firebase.json >/dev/null 2>&1 && HAS_HOSTING=true
+          jq -e '.functions' firebase.json >/dev/null 2>&1 && HAS_FUNCTIONS=true
+
+          {
+            echo "has_firestore_rules=$HAS_FIRESTORE_RULES"
+            echo "has_storage_rules=$HAS_STORAGE_RULES"
+            echo "has_hosting=$HAS_HOSTING"
+            echo "has_functions=$HAS_FUNCTIONS"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Repo project ID : $REPO_PROJECT"
+          echo "firestore.rules : $HAS_FIRESTORE_RULES"
+          echo "storage.rules   : $HAS_STORAGE_RULES"
+          echo "hosting         : $HAS_HOSTING"
+          echo "functions       : $HAS_FUNCTIONS"
+
+      - name: Project ID eslesmesini dogrula
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED="${{ inputs.project_id }}"
+          REPO_PROJECT="${{ steps.detect.outputs.repo_project }}"
+
+          KEY_PROJECT=$(printf '%s' "$SA_JSON" | jq -r '.project_id // empty')
+          if [ -z "$KEY_PROJECT" ]; then
+            echo "::error::Service account JSON gecersiz veya project_id icermiyor."
+            exit 1
+          fi
+
+          FAIL=0
+          if [ "$REPO_PROJECT" != "$EXPECTED" ]; then
+            echo "::error::UYUSMAZLIK - .firebaserc: '$REPO_PROJECT' / beklenen: '$EXPECTED'"
+            FAIL=1
+          fi
+          if [ "$KEY_PROJECT" != "$EXPECTED" ]; then
+            echo "::error::UYUSMAZLIK - anahtar '$KEY_PROJECT' projesine ait / beklenen: '$EXPECTED'"
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "::error::Yanlis Firebase projesine deploy riski. DURDURULDU."
+            exit 1
+          fi
+          echo "Project ID dogrulandi: $EXPECTED"
+
+      - name: Deployment planini olustur
+        id: plan
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          REQUESTED="${{ inputs.targets }}"
+          TARGETS=""
+
+          add_target() { case ",$TARGETS," in *",$1,"*) ;; *) TARGETS="${TARGETS:+$TARGETS,}$1";; esac; }
+
+          if [ "$REQUESTED" != "auto" ]; then
+            IFS=',' read -ra WANTED <<< "$REQUESTED"
+            for t in "${WANTED[@]}"; do
+              t=$(echo "$t" | xargs)
+              case "$t" in
+                firestore:rules) [ "${{ steps.detect.outputs.has_firestore_rules }}" = "true" ] || { echo "::error::firestore.rules yok"; exit 1; } ;;
+                storage)         [ "${{ steps.detect.outputs.has_storage_rules }}" = "true" ]   || { echo "::error::storage.rules yok"; exit 1; } ;;
+                hosting)         [ "${{ steps.detect.outputs.has_hosting }}" = "true" ]         || { echo "::error::hosting yok"; exit 1; } ;;
+                functions)       [ "${{ steps.detect.outputs.has_functions }}" = "true" ]       || { echo "::error::functions yok"; exit 1; } ;;
+                *) echo "::error::Bilinmeyen hedef: $t"; exit 1 ;;
+              esac
+              add_target "$t"
+            done
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE" 2>/dev/null; then
+              CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+            else
+              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
+            fi
+
+            echo "Degisen dosyalar:"; echo "$CHANGED" | sed 's/^/  /'
+
+            echo "$CHANGED" | grep -qE '(^|/)firestore\.rules$'  && add_target "firestore:rules" || true
+            echo "$CHANGED" | grep -qE '(^|/)storage\.rules$'    && add_target "storage"         || true
+            echo "$CHANGED" | grep -qE '(^|/)firestore\.indexes\.json$' && add_target "firestore:indexes" || true
+            if [ "${{ steps.detect.outputs.has_functions }}" = "true" ]; then
+              echo "$CHANGED" | grep -qE '(^|/)functions/' && add_target "functions" || true
+            fi
+            if [ "${{ steps.detect.outputs.has_hosting }}" = "true" ]; then
+              echo "$CHANGED" | grep -qvE '(^|/)(functions/|firestore\.|storage\.)' && add_target "hosting" || true
+            fi
+          fi
+
+          FILTER="${{ inputs.functions_filter }}"
+          if [ -n "$FILTER" ] && [ -n "$TARGETS" ]; then
+            TARGETS=$(echo "$TARGETS" | sed "s/\bfunctions\b/functions:$FILTER/")
+          fi
+
+          if [ -z "$TARGETS" ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "Yayinlanacak degisiklik yok."
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "Deploy edilecek: $TARGETS"
+          fi
+          echo "deploy_targets=$TARGETS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Firebase deployment plani"
+            echo ""
+            echo "| Alan | Deger |"
+            echo "|---|---|"
+            echo "| Repo | ${{ github.repository }} |"
+            echo "| Branch | ${{ github.ref_name }} |"
+            echo "| Project ID | ${{ inputs.project_id }} (dogrulandi) |"
+            echo "| Environment | ${{ inputs.environment }} |"
+            echo "| Hedefler | ${TARGETS:-yok} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy
+    needs: preflight
+    if: needs.preflight.outputs.has_work == 'true' && inputs.dry_run == false
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Node kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Functions bagimliliklarini kur
+        if: contains(needs.preflight.outputs.deploy_targets, 'functions')
+        working-directory: ${{ inputs.working_directory }}/functions
+        run: npm ci || npm install
+
+      - name: Kimlik dosyasini hazirla
+        env:
+          SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SA_JSON" > "$RUNNER_TEMP/gcp-key.json"
+          chmod 600 "$RUNNER_TEMP/gcp-key.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
+
+      - name: Firebase CLI kur
+        run: npm install -g firebase-tools@15
+
+      - name: Deploy
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          firebase deploy \
+            --only "${{ needs.preflight.outputs.deploy_targets }}" \
+            --project "${{ inputs.project_id }}" \
+            --non-interactive \
+            --message "GH Actions: ${{ github.sha }} (${{ github.ref_name }})"
+
+      - name: Kimlik dosyasini sil
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gcp-key.json"
+
+      - name: Ozet
+        if: always()
+        run: |
+          echo "### Deployment tamamlandi" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Project: ${{ inputs.project_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Hedefler: ${{ needs.preflight.outputs.deploy_targets }}" >> "$GITHUB_STEP_SUMMARY"
