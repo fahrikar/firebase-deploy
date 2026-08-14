@@ -1,0 +1,60 @@
+name: Standart Uyum Kontrolu
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.REPO_SCAN_TOKEN || secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Repolari tara
+        id: scan
+        run: |
+          set -euo pipefail
+          MISSING=""
+
+          REPOS=$(gh api "users/$OWNER/repos?per_page=100&type=owner" --paginate \
+                  --jq '.[] | select(.archived==false) | .name')
+
+          for R in $REPOS; do
+            [ "$R" = "${{ github.event.repository.name }}" ] && continue
+
+            if gh api "repos/$OWNER/$R/contents/firebase.json" >/dev/null 2>&1; then
+              if gh api "repos/$OWNER/$R/contents/.github/workflows/deploy-firebase.yml" >/dev/null 2>&1; then
+                echo "OK    : $R"
+              else
+                echo "EKSIK : $R"
+                MISSING="$MISSING - $OWNER/$R"$'\n'
+              fi
+            fi
+          done
+
+          if [ -n "$MISSING" ]; then
+            {
+              echo "missing<<EOF"
+              printf '%s' "$MISSING"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Eksikse issue ac
+        if: steps.scan.outputs.missing != ''
+        run: |
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Firebase deployment standardi uygulanmamis repolar" \
+            --body "Bu repolarda firebase.json var ama deploy workflow yok:
+
+          ${{ steps.scan.outputs.missing }}
+
+          Duzeltmek icin: repo icinde .github/workflows/deploy-firebase.yml olustur, project_id degerini duzelt ve FIREBASE_SERVICE_ACCOUNT_PROD secret'ini ekle." \
+            || echo "Issue zaten acik olabilir."
